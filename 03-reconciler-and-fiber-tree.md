@@ -20,12 +20,12 @@ React 调用 View(props)            ← 函数组件，被"调用"
 <'RCTView' {...props}/>           ← type 是字符串 = ViewNativeComponent
    ↓
 React 看到 type 是字符串
-   → 不再调用任何 JS 组件函数      ← "停止下降"
-   → 建一个 HostComponent fiber
-   → 造原生节点 createNode(...)
+    → 不再调用任何 JS 组件函数
+    → 建一个 HostComponent fiber
+    → 造原生节点 createNode(...)
 ```
 
-**字符串 type 本身就是停止信号**，不存在「再递归进 ViewNativeComponent 一次」——里面没有函数可进。
+在 React 协调中，字符串类型的 `type` 是停止向下深钻（调用组件函数）的信号，因为字符串代表宿主组件，底层无须且无法作为函数进行调用。
 
 ### 真实代码：host fiber 在 completeWork 里造节点
 
@@ -49,10 +49,10 @@ current = {
 
 文本节点同理：`createTextInstance` → `createNode(tag, "RCTRawText", ...)`（`:15902`）。
 
-### 「停止」的精确边界
+### 流程终止的边界与区别
 
-1. 停的是「对当前这一支继续调用 JS 组件函数」。若 View 有子节点（`<View><Text/></View>`），建完 RCTView host fiber 后会**继续协调 children**，Text 又是复合组件 → 再调 `Text(...)`。
-2. 建 host fiber（render 阶段）≠ 造原生 View（commit 阶段）。`createNode` 造的是 **C++ ShadowNode**（仍在 JS/JSI 侧），真正的 `android.view.View` 在更后面经 JNI 到主线程才创建（见 [01](./01-render-pipeline.md) ⑧）。
+1. 停止调用组件函数仅针对当前分支。如果 `<View>` 包含子节点（如 `<View><Text/></View>`），在创建 `RCTView` 的 HostFiber 后，React 会继续对子节点进行协调，如果子节点 `Text` 是复合组件，则继续调用 `Text(...)`。
+2. 构建 HostFiber 与创建原生 View 分属不同阶段。Render 阶段的 `createNode` 用于构建 C++ 层的 ShadowNode，而原生 `android.view.View` 的创建发生在 Commit 阶段，通过 JNI 在主线程执行（参见 [01](./01-render-pipeline.md) 中的步骤 ⑧）。
 
 ### 完整 Fiber 链（`<View><Text>hi</Text></View>`）
 
@@ -68,14 +68,14 @@ View   (函数组件, 被调用)
 
 ## B. Fiber 树何时开始构建？
 
-**结论：在某个 surface 第一次 render 时——不是进程启动那刻，也不是 `registerComponent` 那刻。**
+**触发时机**：Fiber 树的构建始于 Surface 的首次渲染（Render），并非发生在进程启动或执行 `AppRegistry.registerComponent` 时。
 
 ```
 App 启动，加载 JS bundle
-  → AppRegistry.registerComponent('AppName', () => App)   ← 只是"登记工厂"，不建 Fiber
+  → AppRegistry.registerComponent('AppName', () => App)
   ─────────────────────────────────────────────────────
   Native 创建一个 surface / root view（Android: ReactSurface / ReactRootView）
-  → 回调 JS: AppRegistry.runApplication('AppName', params)   ← 触发点！
+  → 回调 JS: AppRegistry.runApplication('AppName', params)
   → renderApplication(...)                                   (renderApplication.js)
   → Renderer.renderElement({element, rootTag})              (renderApplication.js:88)
   → ReactFabric.render(element, rootTag, null, true, ...)   (RendererImplementation.js:28)
@@ -83,11 +83,9 @@ App 启动，加载 JS bundle
   → schedule 初始渲染 → work loop 自顶向下调用组件函数 → 构建 workInProgress Fiber 树
 ```
 
-要点：
+### 核心要点
 
-1. **`registerComponent` 只是登记**，把 `() => App` 存进表，一个 Fiber 都不建。
-2. **真正触发是 `runApplication`**，由原生侧创建 surface 时回调进来。
-3. **每个 surface 一棵独立的 Fiber 树**（独立 `FiberRoot`），多 Activity/多 root view 互不相干。
-4. **双缓冲**：`current`（已提交）与 `workInProgress`（正在构建）两棵；首次构建 workInProgress，commit 后变 current。
-
-> 类比 Android：`registerComponent` ≈ 在 manifest 里声明 Activity；`runApplication` ≈ 系统真正 `onCreate` + `setContentView`。声明 ≠ 实例化。
+1. **`registerComponent` 仅作注册**：该方法仅将 `() => App` 存入注册表，此时不创建任何 Fiber 节点。
+2. **`runApplication` 触发构建**：当原生侧创建 Surface 完毕后，会回调 `runApplication`，此时才真正开始构建 Fiber 树。
+3. **独立的 Fiber 树**：每一个 Surface 均拥有独立的 Fiber 树（即独立的 `FiberRoot`），多个 Activity 或 Root View 之间的渲染上下文互不干扰。
+4. **双缓冲机制**：React 维护 `current`（已提交）与 `workInProgress`（构建中）两棵树。首次渲染会构建 `workInProgress` 树，在 Commit 提交后其将转换为 `current` 树。

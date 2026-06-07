@@ -1,138 +1,138 @@
-# 08 · 重渲染 ≠ 重布局：子节点变大，父容器怎么跟着变
+# 08 · 渲染与布局的解耦：以局部尺寸变更为例
 
-> 问题：改一个 Text 的文本（字号/长度变大），父容器、兄弟节点会跟着"更新"吗？
-> 答案：它们**不需要"重渲染"，但可能需要"重新布局"**——这两件事在 RN 里是解耦的：重渲染归 React，布局归 Yoga。
+> 核心机制：在 React Native 中，组件的“重渲染（Re-render）”与“重新布局（Re-layout）”是相互解耦的两个过程。当某个子节点的尺寸（如 Text 内容）发生变更时，其父容器及兄弟节点通常并不需要重新执行 JavaScript 重渲染，但会在 C++ 层触发重新布局。
 > 相关：[01 渲染链路 ④ Yoga](./01-render-pipeline.md) · [05 两阶段](./05-render-vs-commit-phase.md) · [07 协调剪枝](./07-reconciliation-bailout.md)
 
-> **布局传播的三个方向**（一个孩子变大时）：① 向上 → 父（重算尺寸）；② 横向 → 兄弟（被挤、重定位）；③ 向下 → 自己子树（重测量）。本篇先讲父，再讲兄弟。
+### 布局传播的三个方向
+1. **向上传播**：影响父节点（触发父节点尺寸的重新计算）。
+2. **横向传播**：影响同级兄弟节点（触发同级节点的坐标重定位）。
+3. **向下拉伸**：影响自身子节点（触发测量算法重算）。
 
 ---
 
-## 核心：把"父需要更新"拆成四个独立层面
+## 视图容器更新的四个维度
 
-| 层面 | 父需要吗 | 谁负责 | 何时 |
+| 更新维度 | 父节点是否执行 | 负责模块 | 触发时机 |
 |---|---|---|---|
-| 组件重渲染（JS 函数重跑） | ❌ 不需要 | React bailout | render 阶段 |
-| ShadowNode 克隆（脊柱） | ✅ 会克隆（廉价结构操作） | Fabric `cloneNodeWithNewChildren` | render / completeWork |
-| 布局重算（size/position） | ✅ 若影响到它 | Yoga `markDirtyAndPropagate` 上传 | commit 的 layout pass |
-| 原生 view bounds | ✅ 仅当布局真变 | Differentiator → updateLayout | 主线程挂载 |
+| 组件重渲染 (JavaScript 逻辑重跑) | 否 | React Bailout 机制 | Render 阶段 |
+| ShadowNode 结构克隆 (脊柱克隆) | 是 | Fabric `cloneNodeWithNewChildren` | Render 阶段 / completeWork |
+| 布局计算 (坐标及尺寸计算) | 是 (如果受子节点影响) | Yoga 引擎的 `markDirtyAndPropagate` 标记 | Commit 阶段的 Layout Pass |
+| 原生视图更新 (Native View bounds 更新) | 是 (仅当重新计算的布局发生变化时) | Differentiator 驱动 updateLayout | UI 线程挂载 |
 
-> **一句话**：父不"重渲染"，但会被"克隆脊柱 + 重新布局"。`size 变大 → 父变大` 是 Yoga 在 C++ 里把脏标记从孩子一路传到父算出来的，跟 React 要不要重跑父组件函数毫无关系。
+子节点尺寸变更导致父容器尺寸变大的过程，完全是由 Yoga 引擎在 C++ 层通过脏标记的向上冒泡机制计算完成的，与 React 是否重新调用父组件的 JavaScript 渲染函数无关。
 
 ---
 
-## 第一层：React 重渲染 —— 父 ❌ 不需要
+## 第一层：React 协调层的重渲染决策
 
-[07 的 bailout](./07-reconciliation-bailout.md) 依然成立：Text 文本变，只有 Text 所在的组件函数重跑，**父 View 的组件函数不会被调用**。
+根据 [07 的 Bailout 剪枝机制](./07-reconciliation-bailout.md)，当文本内容变化时，仅有该 Text 节点所在的组件函数会被重新执行，**父容器组件的渲染函数并不会被调用**。
 
-## 第二层：ShadowNode 克隆（不可变树的"脊柱"）—— 父 ✅ 会被克隆，但很轻
+## 第二层：ShadowNode 树的结构克隆（脊柱克隆）
 
-ShadowNode 是**不可变**的。要把父里的旧 Text 换成新 Text，父 ShadowNode 必须**克隆**成"指向新 Text"的新对象；爷爷也得克隆指向新父……**一路克隆到 root**（脊柱克隆 / spine clone）。
+由于 ShadowNode 采用不可变设计，为了实现将旧 Text 节点替换为新 Text 节点，其对应的父 ShadowNode 必须被克隆为指向新 Text 的新节点对象；以此类推，其上方的所有祖先节点直至根节点（Root）均需要重新克隆（此过程称为脊柱克隆 / Spine Clone）。
 
-证据（completeWork host 分支，`ReactFabric-dev.js:10021`）：
+源码参考（completeWork 宿主分支，`ReactFabric-dev.js:10021`）：
 ```js
-? cloneNodeWithNewChildrenAndProps(newProps, _type2)  // 自己 props 也变了
-: cloneNodeWithNewChildren(newProps);                 // 只是孩子变了 → 克隆出新父，指向新孩子
+? cloneNodeWithNewChildrenAndProps(newProps, _type2)  // 自身 Props 发生改变时的克隆
+: cloneNodeWithNewChildren(newProps);                 // 仅子节点发生改变时的克隆
 ```
 
-为什么这**不是"重渲染父"**：
-- **旁支子树按引用共享，不克隆**（结构共享 structural sharing）。
-- 克隆的只是"根到 Text"这条**脊柱**上的几个节点对象，O(树深度) 的**浅操作**。克隆一个对象 ≠ 跑一遍组件函数。
+此操作并不等同于“父组件的重渲染”：
+- **旁支节点结构共享**：未受影响的旁支子树直接共享原始引用，不执行克隆。
+- **浅层对象替换开销**：克隆仅限于从更新源节点至根节点的链路，耗时为 O(树深度) 的浅层克隆，不会重新执行这些节点对应的 JavaScript 组件函数。
 
-> 类比：改链表里一个节点，你得新建从它到头的那几个节点，但其余分支照旧引用——不是把整个链表重算一遍。
+## 第三层：Yoga 引擎的布局计算
 
-## 第三层：Yoga 重新布局 —— ✅ 这才是"父变大"
-
-Text 内容变 → 测量尺寸变 → Yoga 把该节点**标脏**并**向上冒泡到祖先**（`yoga/node/Node.cpp:421`）：
+当 Text 节点内容变更并导致测量尺寸改变时，Yoga 引擎会将该节点标记为“脏（Dirty）”，并向上递归标记其所有祖先节点（`yoga/node/Node.cpp:421`）：
 
 ```cpp
 void Node::markDirtyAndPropagate() {
   if (!isDirty_) {
     setDirty(true);
     if (owner_ != nullptr) {
-      owner_->markDirtyAndPropagate();   // ← 把"脏"向上传给父，一路递归到根
+      owner_->markDirtyAndPropagate();   // 将脏标记向上递归传递至 Root 节点
     }
   }
 }
 ```
 
-- "孩子变大 → 父重新算大小" 由 Yoga 在 **C++ 布局 pass** 靠**脏标记向上传播**完成，**和 React 的 render bailout 是两套独立机制**。
-- Yoga 有**布局缓存**：只重算被标脏的祖先链，未受影响的子树复用上次结果，**不会全树重新布局**。
+- **独立性**：父容器的尺寸重新计算是由 Yoga 在 C++ 层的布局计算阶段（Layout Pass）通过脏标记向上冒泡完成的。此逻辑与 React 的 Render Bailout 分属两个独立的处理阶段。
+- **局部重布缓存优化**：Yoga 内部维护布局缓存，仅重新计算被标记为脏的祖先链，未受影响的子树则直接复用历史布局，避免了全量布局计算。
 
-## 第四层：原生 view —— 父 ✅ 仅当布局真的变了才更新
+## 第四层：原生视图（Native View）的实际更新
 
-布局算完，Differentiator diff 新旧 shadow 树：
-- 父的 `LayoutMetrics`（x/y/w/h）变了 → 产出 **Update（含 updateLayout）** → 主线程调 `parentView.layout(新bounds)`。
-- 父布局没变 → 父**没有任何 mutation**。
+布局计算完成后，Differentiator 模块对新旧 ShadowTree 进行对比：
+- 若父节点的 `LayoutMetrics`（坐标及尺寸）发生改变，则生成 **Update（含 updateLayout）** 变更指令，由 UI 主线程调用 `parentView.layout(新 bounds)`。
+- 若父节点的布局信息未变，则不为父节点生成任何变更指令。
 
 ---
 
-## 关键的"取决于"：父变不变，看父自己的样式 🎯
+## 样式属性对布局更新传播的控制
 
-| 父的样式 | 孩子（Text）变大时 | 父会怎样 |
+| 父节点样式配置 | 子节点尺寸增大时 | 父节点的更新行为 |
 |---|---|---|
-| **flex / auto / 包裹内容** | 父跟着撑大 | Yoga 重算 → 父布局变 → updateLayout，**原生父 bounds 改变** |
-| **固定 width/height** | 父尺寸不动 | 父布局没变 → 父**无 mutation**，Text 可能溢出 / 被 `overflow` 裁剪 |
+| **自适应包裹 (flex / auto / wrapContent)** | 父容器尺寸随之增大 | Yoga 重算 → 父节点布局变更 → 生成 updateLayout，修改原生视图 bounds |
+| **固定宽高 (width/height 为常量)** | 父容器大小保持不变 | 父节点布局未变更 → 不生成 updateLayout，子节点内容可能产生溢出或被裁切 |
 
-所以"父是否更新"不取决于"孩子是否变了"，而取决于"**孩子的变化是否影响到父的布局**"——由父的布局规则决定。
+因此，父节点是否更新并不取决于子节点本身的变化，而是取决于**子节点的变化是否穿透了父节点的样式约束规则**。
 
 ---
 
-## 兄弟节点：会被"重定位"，但通常不"重测量"
+## 兄弟节点的布局更新机制
 
-一个孩子变大，同容器里的兄弟（比如 `column` 布局下后面的节点）会被往下挤、位置变化。它们也会更新吗？
+当某个子节点尺寸增大时，同容器下的兄弟节点（如弹性盒布局 `column` 下方的后续节点）会因空间挤压而改变位置。
 
-**会，但只是"重定位（便宜）"，不是"重测量（贵）"，更不"重渲染"。**
+此时，兄弟节点虽然会被重新定位，但其内部通常不执行“重新测量（Measure）”，更不涉及“JavaScript 重渲染”。
 
-### 反直觉点：脏标记不"横向"传给兄弟
+### 兄弟节点的更新边界与计算优化
 
-Yoga 的脏标记**只向上传播**（孩子→父→…→root），**不会直接把兄弟标脏**。兄弟被重定位是**副作用**：
-- 变大的 Text 把**父**标脏；
-- 父重新跑 flexbox 时，要给**所有孩子**重新分配位置；
-- 后面的兄弟被往下推 → `y` 变了 → Yoga 给它打上 `hasNewLayout`。
+Yoga 的脏标记在传递时**仅向上冒泡**，并不会横向扩散至兄弟节点。兄弟节点坐标变化的实质是：
+- 尺寸增大的节点将**父容器**标脏。
+- 父容器在重新执行 Flexbox 布局计算时，重新分配了各子节点的位置坐标。
+- 受影响的兄弟节点坐标发生偏移 → 触发 `y` 坐标变更 → Yoga 内部将其标记为 `hasNewLayout`。
 
-### 代码：`YogaLayoutableShadowNode::layout`（`:691`）
+### 源码解析：`YogaLayoutableShadowNode::layout`（`:691`）
 
 ```cpp
 for (auto childYogaNode : yogaNode_.getChildren()) {
   auto& childNode = shadowNodeFromContext(childYogaNode);
-  if (childYogaNode->getHasNewLayout()) {        // Yoga 标记"这孩子布局变了"（含仅位置变）
-    childNode.ensureUnsealed();                  // 共享节点在此克隆/解封以便写入
+  if (childYogaNode->getHasNewLayout()) {        // Yoga 标记该子节点布局（坐标或尺寸）发生变更
+    childNode.ensureUnsealed();                  // 浅克隆以解除只读锁定，允许写入更新
     auto newLayoutMetrics = layoutMetricsFromYogaNode(*childYogaNode);
     if (layoutContext.affectedNodes != nullptr)
-      layoutContext.affectedNodes->push_back(&childNode);  // 进 affectedNodes → 触发 onLayout
-    childNode.setLayoutMetrics(newLayoutMetrics);          // 写入新位置/尺寸
+      layoutContext.affectedNodes->push_back(&childNode);  // 加入 AffectedNodes 列表，后续触发 onLayout
+    childNode.setLayoutMetrics(newLayoutMetrics);          // 写入新的相对坐标或尺寸
     if (newLayoutMetrics.displayType != DisplayType::None)
-      childNode.layout(layoutContext);            // 只对"有新布局"的孩子继续往下
+      childNode.layout(layoutContext);            // 仅对有布局更新的子树递归执行 Layout 流程
   }
 }
 ```
 
-### 关键：重定位便宜，重测量被缓存跳过
+### 局部重定位与重测量的复用
 
-Yoga 有布局缓存（`CalculateLayout.cpp:2292` `canUseCachedMeasurement`）：
-- 兄弟自己**内容/尺寸没变** → **复用子树缓存测量**，不重跑它内部 flexbox（重测量被跳过）。
-- 但**位置变了** → `getHasNewLayout()` 为真 → `ensureUnsealed()`(克隆) + `setLayoutMetrics()`(写新坐标)，这是 O(1) 便宜操作。
+Yoga 的缓存机制极大降低了位置偏移的开销（`CalculateLayout.cpp:2292` 中的 `canUseCachedMeasurement`）：
+- **复用测量**：若兄弟节点的内容和自身样式未变更，其内部尺寸测量会被直接缓存复用，跳过内部布局计算。
+- **便宜更新**：若仅坐标（位置）发生偏移，则仅触发一次 `ensureUnsealed()`（Spine 克隆）与 `setLayoutMetrics()`，这属于 O(1) 的低开销操作。
 
-### 兄弟节点的四层（对照下表）
+### 兄弟节点的更新过程对比
 
-| 层面 | 兄弟需要吗 | 说明 |
+| 渲染及布局层次 | 兄弟节点是否需要 | 执行细节 |
 |---|---|---|
-| 组件重渲染（JS 函数） | ❌ | bailout，兄弟组件函数不跑 |
-| 重测量子树（跑 flexbox） | ❌* | *前提：兄弟自己内容/尺寸没变 → 复用缓存 |
-| 写 LayoutMetrics（位置） | ✅ 若位置变 | `ensureUnsealed`(克隆) + `setLayoutMetrics` |
-| 原生 view bounds | ✅ 若位置变 | Differentiator → updateLayout → `siblingView.layout(新坐标)` |
+| 组件重渲染 (JavaScript 逻辑) | 否 | 触发 React Bailout，不执行组件渲染函数 |
+| 尺寸重测量 (内部布局计算) | 否 | 兄弟组件内容及自身尺寸未变时，直接复用 Yoga 布局缓存 |
+| 布局坐标写入 (LayoutMetrics) | 是 (仅当位置偏移时) | 触发 `ensureUnsealed` 并通过 `setLayoutMetrics` 写入新坐标 |
+| 原生视图更新 (Native View bounds) | 是 (仅当位置偏移时) | 经 Differentiator 输出 `updateLayout` 并调用 `siblingView.layout` |
 
-> 附带：位置变了的兄弟会进 `affectedNodes`（`:725`）→ **它的 `onLayout` 回调触发**。这就是"邻居变大时我也收到 onLayout"的原因。
+位置改变的兄弟节点会被加入 `affectedNodes` 列表中，这将在随后触发其 JavaScript 层的 `onLayout` 回调函数。因此，当同级节点尺寸变更时，兄弟节点即便没有重渲染，也依然会收到 `onLayout` 事件。
 
-> 常见现象：长列表里一项变高，下面所有项往下移——它们全被重定位、全发 updateLayout，但都没被重渲染、没被重测量。若这种 reflow 范围大又频繁就会卡，这是**布局抖动（layout thrashing）**，与"无效重渲染"是两类不同的病。
+在长列表等复杂场景下，某一项高度变化会导致其下方所有同级视图发生位移。频繁且大范围的位移会产生大量的原生 `updateLayout` 调用。这种情况在图形学中被称为**布局抖动（Layout Thrashing）**。这属于布局引擎层面的性能问题，与 React 侧的“无效重渲染”属于不同层级的瓶颈。
 
 ---
 
-## 为什么这个解耦很重要
+## 渲染与布局解耦的架构价值
 
-- **render（React）** 决定"组件输出什么"，**layout（Yoga）** 决定"每个节点多大、在哪"。两者各管一摊：
-  - 父样式不变 → 不必重跑父组件函数（省 JS）。
-  - 但只要孩子尺寸影响到父 → Yoga 仍会在 C++ 后台线程把父的布局补算出来（保证视觉正确）。
-- 布局在 **shadow 后台线程** 算（见 [01](./01-render-pipeline.md) ④），不占主线程；原生侧只对真正变化的 view 发 updateLayout。
-- 这也是为什么 RN 性能优化要分清两类问题：**「无效重渲染」（React 层，用 memo/状态下沉解决）** vs **「布局抖动」（Yoga 层，靠减少影响范围、固定尺寸、避免深层 reflow 解决）**。
+- **职能分离**：React 的 Render 过程决定“组件树的逻辑结构”，而 Yoga 引擎则决定“各节点的具体尺寸与空间坐标”。
+  - 若父节点自身的样式约束没有被破坏，则无需重新执行父组件的 JavaScript 函数。
+  - Yoga 在 C++ 异步线程层完成受影响节点的坐标补算，有效确保了排版的精确性。
+- **线程优化**：布局计算运行在后台线程（参见 [01](./01-render-pipeline.md) ④），减少了主线程阻塞；在提交流程中，仅对实际发生尺寸或位置变化的原生视图派发更新指令。
+- **性能优化导向**：React Native 开发中的优化任务被清晰划分为两个维度：**React 协调层（通过 Memo、状态就近设计解决“无效重渲染”）**与 **Yoga 排版层（通过约束布局范围、固定尺寸、防止大范围 Reflow 解决“布局抖动”）**。

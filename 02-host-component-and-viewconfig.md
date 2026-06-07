@@ -5,7 +5,7 @@
 
 ---
 
-## 啊哈时刻：它就是字符串 `'RCTView'`
+## 核心设计：`ViewNativeComponent` 的类型本质
 
 `get()` 最后一行（`NativeComponentRegistry.js:111`）：
 
@@ -14,25 +14,25 @@
 return name;
 ```
 
-**`ViewNativeComponent` 根本不是对象或组件——它就是字符串 `'RCTView'` 本身。**
-写 `<ViewNativeComponent {...props}/>` 等价于 `<'RCTView' {...props}/>`。
+在底层实现中，`ViewNativeComponent` 并不是 React 组件对象，而是**字符串 `'RCTView'` 本身**。
+代码中写 `<ViewNativeComponent {...props}/>` 等价于 `<'RCTView' {...props}/>`。
 
 ---
 
-## 它做了两件运行时的事
+## 运行时的两个核心逻辑
 
-`get('RCTView', configFactory)` 在被 import 时：
+`get('RCTView', configFactory)` 在被引入（import）时会触发以下操作：
 
-**动作 A：注册一个「懒加载的 ViewConfig 工厂」到 JS 侧注册表**
+**1. 注册延迟加载的 ViewConfig 工厂至 JS 侧注册表**
 ```js
 // NativeComponentRegistry.js:55
 ReactNativeViewConfigRegistry.register(name, () => { ... return viewConfig; });
 ```
-第二个参数是**回调**，不立即执行——只有渲染器第一次需要 `'RCTView'` 配置时才调用（即 [03](./03-reconciler-and-fiber-tree.md) 里 `getViewConfigForType`）。
+第二个参数为回调函数，采用懒加载机制——仅在渲染器首次解析 `'RCTView'` 配置时被触发（即 [03](./03-reconciler-and-fiber-tree.md) 中的 `getViewConfigForType`）。
 
-**动作 B：返回字符串 `'RCTView'` 作为宿主组件类型**（`return name`）。
+**2. 返回字符串 `'RCTView'` 作为宿主组件类型**（`return name`）。
 
-所以 `ViewNativeComponent` ≈ **一个字符串 + 一份懒注册的 schema**，是**声明/登记**，不是运行时执行者。
+因此，`ViewNativeComponent` 在形式上等价于**组件名字符串与对应 ViewConfig Schema 的声明组合**，用于元数据登记，本身不承担运行时逻辑。
 
 ---
 
@@ -53,27 +53,25 @@ ReactNativeViewConfigRegistry.register(name, () => { ... return viewConfig; });
 
 ---
 
-## 三个常见疑问的精确答案
+## 常见问题梳理
 
-| 判断 | 对错 | 精确说法 |
+| 概念描述 | 结论 | 说明 |
 |---|---|---|
-| 只是定义文件，定义名字映射和属性 | ✅ 基本对 | 更准确是「注册懒 schema + 返回字符串」两个动作 |
-| 实际不与 C++/原生交互 | ✅ 对（此文件本身） | legacy 反射路径有小例外，见下 |
-| 不作为数据传输 | ✅ 完全正确 | props 数据根本不走这里 |
+| 仅用于定义组件名称映射与属性 | 基本正确 | 更准确的描述是其执行了“注册延迟 ViewConfig Schema”和“返回组件名字符串”两个步骤 |
+| 实际不直接与 C++ 或原生层交互 | 正确 | 此文件自身不直接发起交互，但 Legacy 反射路径存在特例（详见下文） |
+| 不作为数据传输通道 | 正确 | Props 数据的实际传输不经过此文件 |
 
-**为什么不是数据通道**：`<View style={{width:100}}/>` 的 `style` 不经过此文件。真实路径：
+**非数据通道说明**：`<View style={{width:100}}/>` 中的 `style` 数据并不流经此文件。其真实流动路径如下：
 ```
-协调器拿 props → 查 ViewConfig.validAttributes（用 schema 决定怎么处理）
-  → 调 Fabric JSI binding createNode(tag, 'RCTView', surfaceId, props, ...) → 进 C++
+协调器获取 props → 查询 ViewConfig.validAttributes（根据 Schema 验证）
+  → 调用 Fabric JSI 绑定 createNode(tag, 'RCTView', surfaceId, props, ...) → 进入 C++ 层
 ```
-`ViewNativeComponent` 只贡献「组件名」和「schema」。**它是路牌，不是路上的车。**
+`ViewNativeComponent` 仅声明组件名称和 Schema，不参与具体数据的传输。
 
-**legacy 小例外**（`NativeComponentRegistry.js:62`）：旧架构 `!global.RN$Bridgeless` 下，config 回调会调
-`getNativeComponentAttributes(name)` 向原生反射要配置。但 (1) 只在旧架构；(2) 只在那个懒回调被调用时才发生，不是此文件主动发起。
+**Legacy 兼容路径**（`NativeComponentRegistry.js:62`）：在旧架构（非 Bridgeless 模式，即 `!global.RN$Bridgeless`）下，config 回调会通过 `getNativeComponentAttributes(name)` 向原生反射获取配置。但这仅限于旧架构，且只有在该延迟回调被执行时才会发生。
 
 ---
 
-## 一句话总结
+## 总结
 
-> `ViewNativeComponent` 本质是**字符串 `'RCTView'` + 一份懒注册的 ViewConfig schema**。它是**声明**（这个组件叫什么、有哪些合法 props/事件），不是**执行者**，也不是**数据通道**。
-> 类比 Android：像在某个 registry 里 `register("RCTView", configProvider)` 并拿到一个 type token——让系统「认识」这个组件，但搬数据、造 View 是别人的活。
+`ViewNativeComponent` 的本质是组件标识符（字符串 `'RCTView'`）以及在 `ReactNativeViewConfigRegistry` 中懒加载注册的配置 Schema。它负责声明组件元数据（名称、合法属性、支持的事件），而不直接参与渲染时的指令执行或数据流传递。

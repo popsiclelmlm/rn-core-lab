@@ -17,7 +17,7 @@
        ①②                       ③④⑤                        ⑥⑦⑧
 ```
 
-**核心直觉**：布局和 diff 全在 C++ 后台线程算完，最后把一批「原子变更指令」丢给主线程执行。主线程几乎不做计算，只负责「照单创建/摆放 View」。
+**工作原理**：布局计算与 Diff 比较均在 C++ 后台线程完成，最终向主线程下发一批「原子变更指令」。主线程主要负责按照指令创建并布置 View 树，不参与复杂的布局计算。
 
 ---
 
@@ -37,7 +37,7 @@ const actualView = <ViewNativeComponent {...resolvedProps} />;
 Fabric 渲染器（`Libraries/ReactNative/FabricUIManager.js`）通过 **JSI 同步调用** C++ 构建 ShadowNode 树：
 `createNode(tag, "RCTView", surfaceId, props, ...)` / `appendChild` / `completeRoot`。
 
-**这就是干掉 Bridge 的地方**：JSI 让 JS 直接持有 C++ 对象引用，同步调用、零序列化。
+**JSI 替代 Bridge 的实现方式**：JSI 允许 JS 直接持有 C++ 对象引用，通过同步调用避免了数据序列化的开销。
 
 ## ③ C++ 层：ShadowNode 与工厂
 
@@ -60,7 +60,7 @@ Fabric 渲染器（`Libraries/ReactNative/FabricUIManager.js`）通过 **JSI 同
 enum Type : std::uint8_t { Create=1, Delete=2, Insert=4, Remove=8, Update=16 };
 ```
 
-**最该理解的一步**：React 在 JS 侧 diff「哪些组件变了」，Fabric 在 C++ 侧翻译成「对原生树的最小原子操作序列」。主线程拿到的就是这份「施工清单」。
+**关键机制**：React 在 JS 侧对比组件树的变更，而 Fabric 在 C++ 侧将这些变更翻译为针对原生视图树的最小原子操作序列（即变更指令集），主线程最终执行这些指令。
 
 ## ⑥ C++ → Android：跨 JNI 边界
 
@@ -88,6 +88,6 @@ viewState.view = viewManager.createView(...)
 
 ---
 
-## 一句话串起来
+## 渲染流程总结
 
-> JSX `<View>`（host component，名 `RCTView`）→ JSI 同步在 C++ 建不可变 ShadowNode 树 → Yoga 后台算布局 → Differentiator diff 出 Create/Insert/Update 指令 → 打包成 IntBuffer 经 JNI 交给主线程 → SurfaceMountingManager 照单让 ReactViewManager `new ReactViewGroup()` 并摆放 → 上屏。
+JSX 中的 `<View>`（宿主组件，名称为 `RCTView`）通过 JSI 在 C++ 层同步构建不可变的 ShadowNode 树。Yoga 引擎在后台线程完成布局计算后，Differentiator 对比新旧两棵树，生成包含 Create/Insert/Update/Remove/Delete 等操作的变更指令。这些指令经打包后通过 JNI 传递到 UI 线程，由 `SurfaceMountingManager` 调度对应的 `ReactViewManager` 进行原生 View 的创建与排版，最终完成上屏渲染。

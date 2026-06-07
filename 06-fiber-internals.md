@@ -1,6 +1,6 @@
 # 06 · Fiber 内核：数据结构、迭代遍历、协作式可中断
 
-> 全系列的「骨架」。Fiber 这个数据结构的精妙，**同时**解决了「不用递归遍历树」和「能中断」两件事。
+> 核心设计：本篇介绍 Fiber 节点的数据结构，阐述其如何通过链表结构替代传统的递归树遍历，并实现非阻塞的协作式可中断渲染。
 > 相关：[03 协调器](./03-reconciler-and-fiber-tree.md) · [05 两阶段](./05-render-vs-commit-phase.md)
 
 ---
@@ -28,7 +28,9 @@ fiber = {
 }
 ```
 
-**核心认知**：加上 `child / sibling / return` 三个指针后，**一棵树就变成了一张能用单个「当前位置指针」逐个走过去的链表**——不再需要递归。
+### 树结构向链表的转换
+
+通过引入 `child`、`sibling` 和 `return` 指针，传统的树形结构在遍历时可以被抽象为单向链表。这种设计允许遍历过程使用单一指针进行迭代控制，消除了对系统递归调用栈的依赖。
 
 ```
         App
@@ -43,136 +45,134 @@ fiber = {
 
 ---
 
-## 二、遍历算法：workInProgress → 生成 C++ Node
+## 二、遍历算法：workInProgress 树的非递归遍历
 
-### 整个遍历就是一个 while 循环
+### 基于循环的非递归遍历
 
 ```js
 // ReactFabric-dev.js:13965
 function workLoopSync() {
-  for (; null !== workInProgress; )   // 只要"当前位置"不为空，就一直处理
+  for (; null !== workInProgress; )
     performUnitOfWork(workInProgress);
 }
 ```
 
-`workInProgress` 是全局指针，记录「我现在走到哪个 fiber 了」。**整个遍历状态浓缩在这一个指针上**。
+`workInProgress` 是全局指针，用于指向当前正在处理的 Fiber 节点。遍历的即时进度完全由该指针的值决定。
 
-### 往下钻 or 往上爬
+### 深度优先遍历的演进逻辑
 
 ```js
 // performUnitOfWork :14130
-const next = beginWork(fiber);   // 返回"第一个孩子"或 null
-if (next === null) completeUnitOfWork(fiber);  // 没孩子 → 往上"完成"
-else workInProgress = next;                     // 有孩子 → 移到孩子（往下钻）
+const next = beginWork(fiber);   // 钻取至第一个子节点，若无子节点则返回 null
+if (next === null) completeUnitOfWork(fiber);  // 无子节点时，开始向上回溯并执行完成逻辑
+else workInProgress = next;                     // 转移至子节点进行深钻
 ```
 
 ```js
 // completeUnitOfWork :14257（精简）
 let node = fiber;
 do {
-  completeWork(node);                // ★ host 组件在这里 createNode 建 C++ ShadowNode
-  if (node.sibling !== null) { workInProgress = node.sibling; return; }  // 转兄弟
-  node = node.return;                // 没兄弟 → 爬回父节点
+  completeWork(node);                // 宿主组件在此调用 createNode 创建 C++ ShadowNode
+  if (node.sibling !== null) { workInProgress = node.sibling; return; }  // 转移至兄弟节点
+  node = node.return;                // 无兄弟节点时，回溯至父节点
   workInProgress = node;
 } while (node !== null);
 ```
 
-### 拿上面那棵树走一遍（★ = 生成 C++ Node）
+### 遍历步骤模拟（以下步骤中包含 C++ 节点的创建）
 
 | 步 | 当前位置 | 做什么 | 下一步 |
 |---|---|---|---|
-| 1 | App | beginWork → 有孩子 View | View |
-| 2 | View | beginWork → 有孩子 Text | Text |
-| 3 | Text | beginWork 无孩子 → complete：**★ createNode(Text)**；有兄弟 Image | Image |
-| 4 | Image | complete：**★ createNode(Image)**；无兄弟 → 爬回 View | View |
-| 4'| View | complete：**★ createNode(View)** + 把 Text/Image 挂上去（`appendAllChildren` `:10073`）；爬回 App | App |
-| 5 | App | complete；无父 → 结束 | null |
+| 1 | App | beginWork → 发现子节点 View | View |
+| 2 | View | beginWork → 发现子节点 Text | Text |
+| 3 | Text | beginWork 无子节点 → completeWork：创建 C++ 节点并挂载 Text；发现兄弟节点 Image | Image |
+| 4 | Image | completeWork：创建 C++ 节点并挂载 Image；无兄弟节点 → 回溯至 View | View |
+| 4'| View | completeWork：创建 C++ 节点并挂载 View，同时将 Text/Image 子树关联（`appendAllChildren` `:10073`）；回溯至 App | App |
+| 5 | App | completeWork；已无父节点 → 遍历结束 | null |
 
-**生成顺序 Text → Image → View（自底向上）**：父节点 complete 时把已建好的孩子挂上去。这就是迭代式 DFS——**没有递归，调用栈不会变深**。
+**自底向上的节点完成顺序**：子节点构建完成后，父节点在 Complete 阶段通过 `appendAllChildren` 将其挂载。这种设计实现了非递归的迭代式深度优先遍历（DFS），避免了函数调用栈的累积。
 
 ---
 
-## 三、可中断：精妙就在这里
+## 三、非阻塞可中断机制的实现原理
 
-### 同步 vs 并发，唯一区别一句话
+### 同步与并发模式的循环对比
 
 ```js
-// 同步：跑到底（紧急更新）           :13965
+// 同步模式：直接遍历完成                                 :13965
 function workLoopSync() {
   for (; null !== workInProgress; ) performUnitOfWork(workInProgress);
 }
-// 并发：每处理一个就问"该让出了吗"     :14126
+// 并发模式：在遍历过程中通过 shouldYield 评估是否需要释放线程控制权    :14126
 function workLoopConcurrentByScheduler() {
   for (; null !== workInProgress && !shouldYield(); ) performUnitOfWork(workInProgress);
 }
 ```
 
-区别只是多了 `&& !shouldYield()`。
+并发模式在每次迭代前均会评估 `shouldYield()` 的状态。
 
-- **暂停 = for 循环退出**。`shouldYield()` 为 true → 循环条件不满足 → 函数返回，控制权交还事件循环。`workInProgress` 指针停在原地。
-- **恢复 = 再调一次这个循环**。它读全局 `workInProgress`，从上次离开的 fiber 继续。
+- **任务暂停**：当 `shouldYield()` 返回 `true` 时，循环条件不再满足，工作循环退出并释放主线程控制权。此时，`workInProgress` 指针保留在当前节点位置，即时进度信息得以保留在堆内存中。
+- **任务恢复**：再次触发该工作循环时，系统读取全局 `workInProgress` 指针，即可无缝从上次暂停的节点继续向下执行。
 
-### 为什么这么轻松？——你问的「数据结构的精妙」
+### 堆内存现场保留的优势
 
-**整个「我走到哪了」的状态，被压成一个 `workInProgress` 指针 + 堆上那棵 fiber 树。** 暂停=不动指针、退出循环；恢复=读指针、继续循环，**零成本**。
+在 Fiber 架构中，遍历的上下文信息（当前节点、父节点、兄弟节点）全部被保存在堆内存中的 Fiber 节点属性（`child`、`sibling`、`return`）以及全局指针 `workInProgress` 中。因此，中断和恢复仅需要停止或重启循环控制，不需要额外的现场保护与恢复成本。
 
-对比**递归**：
-
+作为对比，传统的递归遍历（如早期 React 的 Stack Reconciler）：
 ```js
 function reconcile(fiber) {
-  for (const child of fiber.children) reconcile(child); // "进度"埋在引擎调用栈 N 层栈帧里
+  for (const child of fiber.children) reconcile(child); // 遍历进度隐式保存在引擎的调用栈中
 }
 ```
+其遍历进度完全依赖于 JS 引擎的调用栈帧。一旦函数调用开始，便无法在不销毁调用栈的情况下暂停并让出主线程。
 
-递归的进度散落在**引擎自己的调用栈**里，没法存下来再返回事件循环，也没法从栈中间恢复。这正是**老版 React（stack reconciler）无法中断**的根本原因。
-
-> **一句话**：React 把「引擎拥有的、藏在调用栈里、动不了的递归进度」改造成「React 自己拥有的、放在堆上一个指针里、随便存取的链表进度」。这个改造就是 Fiber 的灵魂，可中断只是免费副产品。
+**架构本质**：Fiber 架构将原先依赖系统调用栈管理的隐式递归过程，重构为由开发者在堆内存中显式维护的单向链表遍历过程。这种数据结构层面的重构，是实现可中断渲染的核心基础。
 
 ---
 
-## 四、这不是「线程切换」，是协作式调度
+## 四、基于协作式时间分片的单线程调度
 
-JS 是单线程，**没有也不需要线程切换**。这是**协作式调度（时间分片）**：
+JavaScript 采用单线程执行模型，并不涉及操作系统层面的线程上下文切换。Fiber 的中断是基于协作式调度（时间分片）实现的：
 
-| | 抢占式（OS 线程） | 协作式（React Fiber） |
+| 调度属性 | 操作系统抢占式调度 | React Fiber 协作式调度 |
 |---|---|---|
-| 谁决定切换 | 操作系统，可在任意指令处强行中断 | React 自己，只在"两个 fiber 之间"主动停 |
-| 保存现场 | OS 保存 CPU 寄存器、整个栈 | 啥都不用存——`workInProgress` 指针就是现场 |
-| 需要配合吗 | 不需要，被动挨打 | 需要，主动问 `shouldYield()` |
+| **控制权切换决策** | 由操作系统强制切换，可在任意指令执行处中断 | 由 React 主动决定，仅在 Fiber 节点交界处中断 |
+| **执行上下文保存** | 操作系统保存 CPU 寄存器及系统调用栈现场 | 无需额外保存，`workInProgress` 指针即代表当前现场 |
+| **线程协作要求** | 执行线程无感知被动中断 | 需要执行单元主动查询 `shouldYield()` 并让出控制权 |
 
-- 单线程从未切换；React 只是把自己的大任务**切成片**，干一片**主动让出**给事件循环，稍后回来干下一片。
-- 中断点只能在 **fiber 与 fiber 之间**——这就是每个 fiber 叫 **unit of work（工作单元）** 的原因：它是能让出的最小颗粒。
-- `shouldYield()` 看「这片时间预算（约几毫秒）用完没」「有没有更高优先级任务在排队」。RN 里调度器是 C++ 的 `RuntimeScheduler`，有 `getShouldYield()`（`RuntimeScheduler_Modern.h:99`）和 `scheduleTask(SchedulerPriority priority, ...)`。
+- 协作式中断：在单线程环境下，React 将庞大的渲染任务拆分为细粒度的工作单元（即单个 Fiber 的处理），在两个单元之间主动调用 `shouldYield()` 评估是否需要释放主线程，从而实现与用户交互、动画等高优先级任务的交替执行。
+- 中断的时机只能发生在 Fiber 节点处理的交界处。每个 Fiber 节点即为一个独立的工作单元（Unit of Work）。
+- `shouldYield()` 用于判断当前时间片（通常为数毫秒）是否已耗尽，或者是否有更高优先级的任务等待处理。在 React Native 中，该调度器由 C++ 层的 `RuntimeScheduler` 实现，核心接口包括 `getShouldYield()` 和 `scheduleTask`。
 
-> 🎁 "Fiber" 这个名字本身就来自系统编程里的 **fiber = 用户态协作式轻量线程**（对应内核态、抢占式的 OS thread）。React Fiber = 在用户态用协作式调度跑渲染工作。
-
----
-
-## 五、与 Android VSync 帧模型的关系（重要澄清）
-
-Android 帧渲染（`Choreographer.doFrame` → measure/layout/draw）在主线程**同步跑、run-to-completion、不可中断**，超时就掉帧。这点和 React 一致：
-
-- React 能被打断的是 **render / reconciliation（算树，纯计算）**；
-- React 的 **commit（真正改 view）和 Android 的 traversal 一样不可中断**。
-
-**为什么 React 需要可中断的算树、而 Android 没有这套机制？**
-
-- Android 每帧 measure/layout/draw 是 **native、很快**，框架假设它能塞进一帧；耗时活靠开发者**手动丢后台线程**，框架不切片。
-- React 的 reconciliation 跑**任意 JS 用户代码**（成百上千组件函数 + diff），可能很重，所以框架自己**按优先级切片调度**。
-
-RN 特有：**JS 跑在独立 JS 线程**，reconciliation 卡的是 JS 线程（影响响应新 state/touch），不直接卡 Android 主线程的滚动绘制——这跟 React DOM（JS 与渲染同线程）不同。
+> 💡 **术语说明**：在操作系统概念中，纤程（Fiber）是指由用户态控制、采用协作式调度的轻量级线程。React 借用此概念，命名其协作式调度的最小执行单元。
 
 ---
 
-## 六、可中断 + 可丢弃 = Concurrent 的完整能力
+## 五、与 Android VSync 帧模型的对比分析
 
-因为 workInProgress 是独立草稿树（双缓冲）+ render 无副作用（见 [05](./05-render-vs-commit-phase.md)），高优先级更新插队时，React 可以**直接丢弃搭了一半的草稿树**重搭——current 树没被动过，零风险。这也解释了「render 为什么必须无副作用、可重入」：**它真的可能被丢弃后重跑**。
+Android 原生框架的帧渲染流程（如 `Choreographer.doFrame` 触发的 Measure、Layout 与 Draw）在 UI 主线程上是同步且一次性执行完成的，在此期间不可中断。这与 React 的 Commit 阶段设计一致：
+
+- React 能够被中断的仅是 **Render 阶段**的 Reconciliation 过程（纯 JS 逻辑的计算过程）。
+- React 的 **Commit 阶段**（原生视图更新）与 Android 原生的 Layout/Draw 一样，属于不可中断的同步执行过程。
+
+### 为什么 Android 原生框架无需此类中断机制？
+
+1. Android 原生框架的 Measure/Layout/Draw 过程由 C++ 及 Java 高效执行，框架默认其能在 16.6ms（或更短）的帧周期内完成；对于耗时较长的复杂计算，则建议由开发者将其手动迁移至后台工作线程处理。
+2. React 的 Reconciliation 阶段运行的是开发者的 JavaScript 代码，可能包含大规模的组件遍历与 Diff 计算。为了避免阻塞主线程交互，React 在框架层实现了自动的切片调度与中断机制。
+
+在 React Native 中，JavaScript 引擎运行在独立的 JS 线程。Reconciliation 阻塞的是 JS 线程（影响对新 State 和手势事件的响应），并不直接阻塞 Android 主线程的滚动和绘制，这与 Web 端的 React DOM（JS 执行与渲染共享主线程）存在本质区别。
 
 ---
 
-## 总synthesis
+## 六、并发模式的核心能力：可中断与可丢弃
 
-> **遍历**：树靠 `child/sibling/return` 三指针变成 while 循环的迭代 DFS——往下 beginWork、往上 completeWork（顺手 createNode），自底向上拼成 ShadowNode 树。
-> **可中断**：进度被压成一个 `workInProgress` 指针放在堆上，暂停=退出循环、恢复=再进循环，零成本。
-> **不是线程切换**：单线程上的协作式时间分片——主动在 fiber 之间问「该让了吗」。
-> **精妙就在数据结构**：把「引擎调用栈里动不了的递归进度」改成「堆上随便存取的链表指针」——这一步同时买下了「迭代遍历」和「可中断」。
+借助于双缓冲机制中的 `workInProgress` 树和无副作用的 Render 阶段（参见 [05](./05-render-vs-commit-phase.md)），当调度器接收到更高优先级的更新任务时，React 可以选择丢弃当前正在构建的 `workInProgress` 树，重新为高优先级更新构建新树。由于已提交的 `current` 树在内存中保持不变，因此重置计算过程不会带来任何状态副作用，这也解释了为何组件的 Render 函数必须设计为无副作用的纯函数。
+
+---
+
+## 总结
+
+- **遍历算法**：通过 Fiber 节点的 `child`、`sibling` 和 `return` 指针，将传统的递归树遍历转换为基于循环的迭代深度优先搜索（DFS）过程。子节点在 CompleteWork 阶段构建，并自底向上构建整个 C++ ShadowNode 树。
+- **可中断特性**：由于更新的中间状态被完全存储在堆内存的全局指针 `workInProgress` 和 Fiber 链表中，使得工作循环的暂停与恢复可以通过简单的循环控制语句完成，开销极低。
+- **调度模式**：利用单线程上的协作式时间分片（协作式调度），在执行单元交界处通过主动查询 `shouldYield()` 来决定是否出让控制权，从而实现非阻塞渲染。
+- **设计价值**：将基于系统调用栈管理的隐式递归过程改造为由 JavaScript 堆内存管理的显式链表遍历过程，从而在底层同时实现了非递归遍历与协作式可中断渲染。

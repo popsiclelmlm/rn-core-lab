@@ -1,18 +1,18 @@
 # 04 · 组件的挂载与卸载
 
-> 一条统一定律，解释「三元 null」「Navigation pop」「`&&` 短路」为什么都会卸载组件。
+> 核心机制：解析三元表达式（如 `null`）、路由跳转（如 Navigation pop）及逻辑短路等操作时，React 框架内部统一的组件卸载行为。
 > 相关：[03 Fiber 树](./03-reconciler-and-fiber-tree.md) · [05 两阶段](./05-render-vs-commit-phase.md)
-> ⚠️ React Navigation / react-native-screens 是**社区库，不在 core 仓库**，但它们的懒加载完全建立在下面这条 React 核心定律上。
+> ⚠️ React Navigation / react-native-screens 是社区库，并非 React Native Core，但它们的延迟加载与卸载机制依然遵循 React 的核心卸载逻辑。
 
 ---
 
-## 统一定律
+## 核心机制：元素消失与组件卸载
 
-> **某个组件元素「上一次 render 输出里有，这一次没有了」→ React 卸载它的 Fiber 子树。**
+若某个组件元素在当前渲染（Render）阶段的输出中不再存在，而在上一次渲染输出中存在，React 将对其 Fiber 子树执行卸载（Unmount）操作。
 
-卸载会：销毁 Fiber 子树、移除原生 view、丢失组件 state、执行 `useEffect` cleanup / `componentWillUnmount`。
+执行卸载操作时，框架会销毁对应的 Fiber 子树、移除原生视图、清除组件的 State，并触发 `useEffect` 的清理函数（cleanup）或 `componentWillUnmount` 生命周期方法。
 
-### 不是「null」特殊，而是「元素消失」特殊
+### 组件卸载的判定标准
 
 下面三种写法效果完全相同，都会卸载 `<X/>`：
 
@@ -29,38 +29,36 @@
 
 ---
 
-## 应用一：Navigation 多页面是否一次性全建？
+## 导航机制：多页面按需构建
 
-**不会。页面的 Fiber 子树按导航状态懒构建。**
+在单页应用导航中，页面的 Fiber 子树往往是根据导航状态延迟构建的。
 
-`<Stack.Screen name="Home" component={HomeScreen}/>` 只是**配置**，不直接渲染 `HomeScreen`。Navigator 读当前
-**navigation state**，只渲染当前状态里的屏幕。某屏幕组件函数只有进入「被渲染集合」时才被调用 → 那时才建它的 Fiber 子树。
+`<Stack.Screen name="Home" component={HomeScreen}/>` 仅作为声明式配置，并不直接实例化 `HomeScreen`。导航器根据当前维护的 **Navigation State** 确定需要渲染的屏幕。只有当屏幕被纳入活跃渲染集合时，其组件函数才会被调用，进而构建对应的 Fiber 子树。
 
-| 类型 | 首次构建时机 |
+| 导航器类型 | 首次构建时机 |
 |---|---|
-| **Stack（栈）** | 启动只建初始路由；`push('Detail')` 时 Detail 才进入 state → 这时才建其 Fiber |
-| **Tab / Drawer** | 有 `lazy`（bottom-tabs 默认 `true`）；lazy 下某 tab 第一次聚焦才建 Fiber |
+| **Stack（栈）** | 启动时仅构建初始路由页面；当执行 `push('Detail')` 且 Detail 页面进入 Navigation State 时，才开始构建其 Fiber 子树。 |
+| **Tab / Drawer** | 通常包含 `lazy` 属性（如 bottom-tabs 默认开启）；首次聚焦到特定 Tab 时才开始构建其 Fiber 子树。 |
 
 ---
 
-## 应用二：push（隐藏） vs pop（卸载）
+## 导航生命周期：Push（隐藏）与 Pop（卸载）
 
-**决定一个屏幕在不在 Fiber 树里的唯一标准是「它在不在 navigation state（栈）里」，与可不可见无关。**
+屏幕组件是否在 Fiber 树中挂载，取决于它是否包含在 Navigation State（栈）中，而与其实际可见性无关。
 
 ```
-push Detail 后:   routes = [Home, Detail]   ← 两个都在 state
-pop  Detail 后:   routes = [Home]           ← Detail 离开 state
+push Detail 后:   routes = [Home, Detail]   （两个页面均在状态栈中）
+pop  Detail 后:   routes = [Home]           （Detail 页面移出状态栈）
 ```
 
-| 操作 | 栈变化 | 那个屏幕的 Fiber |
+| 操作类型 | 状态栈变化 | Fiber 子树状态 |
 |---|---|---|
-| **push Detail** | `[Home]` → `[Home, Detail]` | Home **仍在栈 → 保持 mounted**（在下面，隐藏但不卸载） |
-| **pop Detail** | `[Home, Detail]` → `[Home]` | Detail **离开栈 → 卸载销毁** |
+| **Push Detail** | `[Home]` → `[Home, Detail]` | Home 仍在栈内，保持 Mounted 状态（此时处于底层隐藏状态） |
+| **Pop Detail** | `[Home, Detail]` → `[Home]` | Detail 移出栈外，执行卸载并销毁 |
 
-**场景：Home → push Detail → pop 回 Home**，此时 Detail **会被卸载**（Fiber 子树、state、原生 view 全销毁），
-只是通常等**退场动画结束**后才真正卸载。
+在 **Home → Push Detail → Pop 回 Home** 的场景中，Detail 页面将被完全卸载（销毁其 Fiber 子树、State 以及原生 View），此过程通常在退场动画结束后完成。
 
-**自证**：`push → pop → 再 push Detail`，第二次是全新 mount（state 重置、effect 重跑），说明第一次确实被销毁了。
+**验证方式**：若执行 `push → pop → 再次 push Detail`，第二次进入将触发全新的挂载流程（State 重置，Effect 重新执行），可验证先前实例已被销毁。
 
 ```jsx
 useEffect(() => {
@@ -70,15 +68,15 @@ useEffect(() => {
 
 ---
 
-## 隐藏 ≠ 卸载（state 去留的根因）
+## 隐藏与卸载的对比及状态保持
 
-| 写法 | 结果 | state |
+| 实现方式 | 运行结果 | 组件 State |
 |---|---|---|
-| `{cond ? <X/> : null}` / pop | **卸载** Fiber 子树 | 丢失 |
-| `<X style={{display: cond?'flex':'none'}}/>` | 保留 mounted，仅不显示 | 保留 |
-| react-freeze / `<Activity mode="hidden">` / push 后下层屏幕 | 保留 mounted，停止重渲染 | 保留 |
+| 三元表达式（`cond ? <X/> : null`） 或 Pop 路由 | **卸载** Fiber 子树 | 丢失 |
+| 样式控制（`<X style={{display: cond ? 'flex' : 'none'}}/>`） | 保持 Mounted，仅在视觉上隐藏 | 保留 |
+| 容器冻结（如 react-freeze / `<Activity mode="hidden">` / 处于底部的页面） | 保持 Mounted，但暂停其重渲染过程 | 保留 |
 
-源码里「隐藏」的实现（`ReactFabric-dev.js:15952`）走的是 clone 出 `display:none` 的新节点，而非删除：
+在 React Native 中，视觉隐藏的底层实现（`ReactFabric-dev.js:15952`）通常是通过克隆并应用 `display: none` 属性，而不是执行节点删除：
 
 ```js
 function cloneHiddenInstance(instance) {
@@ -89,21 +87,21 @@ function cloneHiddenInstance(instance) {
 
 ---
 
-## 两个层面别混：JS Fiber 树 ≠ 原生 View 树
+## 架构分层：JavaScript Fiber 树与原生 View 树
 
-`react-native-screens` 优化的是**原生侧**：即使 React 让不可见屏幕保持 mounted（Fiber 还在 JS 内存），
-它可以把对应**原生 view 从视图层级 detach**（`activityState=inactive`），省原生内存——**但不等于销毁 Fiber**。
+`react-native-screens` 优化主要针对原生视图树：即使 React 依然在 JavaScript 内存中保留不可见屏幕的 Fiber 节点，该组件对应的原生 View 也可以从底层的视图树中分离（Detach，如 `activityState=inactive`）以节省原生内存，这并不等同于销毁 JS 层的 Fiber 树。
 
-| 层面 | 谁管 | 不可见页面 |
+| 架构层 | 管理者 | 不可见页面的处理方式 |
 |---|---|---|
-| JS Fiber 树 | React | 已 mount 的保留（除非配置卸载/冻结） |
-| 原生 View 树 | react-native-screens | 可被 detach，省原生内存 |
+| JS Fiber 树 | React | 保持 Mounted 状态（除非显式配置卸载或冻结） |
+| 原生 View 树 | react-native-screens | 视图从层级结构中 Detach，释放原生资源 |
 
 ---
 
-## 闭环到底层
+## 底层执行逻辑
 
-JS 层卸载 → C++ Differentiator diff 出 **Remove + Delete** mutation（`ShadowViewMutation.h:84`：`Remove=8, Delete=2`）
-→ JNI → 主线程 `SurfaceMountingManager.removeViewAt` → 原生 view 从父 ViewGroup 移除。
+当 JS 层触发卸载时，C++ Differentiator 模块对比新旧树并输出 **Remove** 与 **Delete** 变更指令（`ShadowViewMutation.h:84` 中定义了 `Remove=8, Delete=2`），这些指令通过 JNI 传递给 Android UI 线程，由 `SurfaceMountingManager.removeViewAt` 将原生视图从父 `ViewGroup` 中移除。
 
-> **一句话**：「元素从这次 render 输出里消失」是 React 唯一的卸载触发条件——三元 null、`&&` 短路、类型变、key 变、Navigation pop 都是它的不同外衣。区别只在于你要「真卸载」还是「假隐藏」。
+## 总结
+
+元素在渲染输出中的消失是触发组件卸载的唯一条件。无论是条件渲染、类型变更、Key 的更新，还是导航栈的 Pop 操作，其底层的卸载机制完全一致。开发者应根据是否需要保留状态（State），选择完全卸载或局部隐藏。
